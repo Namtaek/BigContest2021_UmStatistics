@@ -1,0 +1,689 @@
+## title: "2. Modeling - ECO제주 모델링파일"
+## author: "UmStatistics - 권남택, 오정민, 유경민, 이상현"
+## date: '2021년 9월 15일 수요일'
+
+
+## 본 파일은 2021 빅콘테스트 ECO 제주 참가팀 **UmStatistics**의 제출 파일입니다. 
+## 이 `Modeling` 파일에서는 `Arima`/`GWR`/`LightGBM`/`BART`에 대한 학습과 7/8월 예측이 포함되어 있습니다.
+
+## 구성은 다음과 같습니다.
+
+## 1. 월별 예측
+##    1) Arima 모델 학습과 예측
+##    2) GWR 모델 학습과 예측
+## 2. 일별 예측
+##    1) LightGBM 모델 학습과 예측
+##    2) BART 모델 학습과 예측
+## 3. 앙상블
+
+
+# 0. 사전 작업
+
+## 0.1 라이브러리 로드와 함수
+
+#require(devtools) 
+#install_version("lightgbm", version = "3.1.0", repos = "http://cran.us.r-project.org")
+
+
+# 함수 자동 설치
+pacotes = c("tidyverse", "data.table", "lubridate", 'forecast', 'spgwr', 'lightgbm', 'BayesTree')
+
+package.check <- lapply(pacotes, FUN = function(x) {
+  if (!require(x, character.only = TRUE)) {
+    install.packages(x, dependencies = TRUE)
+  }
+})
+
+## ---- warning = F, message = F---------------------------------------------------------------------------------------------------------
+library(data.table)     # 데이터 전처리
+library(lubridate)      # 시간 데이터 전처리
+library(forecast)       # 시계열 예측
+library(spgwr)          # 공간회귀모델
+library(BayesTree)      # BART 모델
+library(lightgbm)       # LightGBM 모델
+library(tidyverse)      # 데이터 전처리
+'%notin%' = Negate('%in%') # 함수 설정
+
+
+
+## 0.2 워킹 디렉토리 설정
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+CURRENT_WORKING_DIR <- dirname(rstudioapi::getActiveDocumentContext()$path)
+CURRENT_WORKING_DIR
+setwd(CURRENT_WORKING_DIR)
+
+
+# 1. 월별 예측
+
+#### 월별 데이터 불러오기
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+monthly_data = fread('data/monthly_imputed_joined_data.csv') %>% select(c(yyyymm, emd_nm, monthly_em_g))
+
+
+## 1.1 Arima 모델 학습과 예측
+
+## 불러온 데이터를 동별로 list를 통해 저장합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+data_list = split(monthly_data, monthly_data$emd_nm)
+dong_list = names(data_list)
+
+
+## 이전에 train data를 통해 사전에 구한 arima 최적의 차수를 불러옵니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+dong_order = fread('data/arima_pdq.csv')
+dong_order %>% head(2)
+
+
+#### Arima 학습과 예측
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+arima_pred_result = data.frame(emd_nm = dong_list, july = 0, august = 0)
+
+for(m in 1:length(dong_list)){
+  
+  data = data_list[[m]]$monthly_em_g
+  
+  p = dong_order[m, 'p'] %>% as.numeric()
+  d = dong_order[m, 'd'] %>% as.numeric()
+  q = dong_order[m, 'q'] %>% as.numeric()
+  
+  fit.arima = Arima(data, order = c(p, d, q), method = 'ML')
+  pred = forecast(fit.arima, h = 2)$mean[1:2]
+  
+  arima_pred_result[m, 'july'] = pred[1]
+  arima_pred_result[m, 'august'] = pred[2]
+}
+
+
+## 최적의 차수를 집어넣고, 학습을 진행한 후 7월과 8월을 예측합니다. 그 결과는 다음과 같습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+arima_pred_result %>% head(2)
+
+
+
+## 1.2 GWR 모델 학습과 예측
+
+## 공간 회귀 모델을 통한 학습과 예측을 진행하겠습니다.
+
+## 먼저 시간과 관련된 변수들을 추가적으로 생성합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+monthly_data = fread('data/monthly_imputed_joined_data.csv')
+monthly_data_without_unknown = 
+  monthly_data %>% filter(emd_nm != '알수없음') %>% as.data.frame() %>%   # 알수없음 제외
+  mutate(base_month = month(yyyymm), base_year = year(yyyymm),            
+         t = base_month + (base_year-2018)*12,                            # 추세 변수
+         msin = sin(2*pi/12*t), mcos = cos(2*pi/12*t))                    # 계절성 변수
+
+
+## 먼저 한 달 뒤를 예측하기 위한 모델을 학습하고 7월을 예측합니다. 
+## 한 달 뒤의 배출량을 예측하는 데에 있어 이전 달의 배출량이 매우 중요할 것으로 생각되기 때문에, 
+## 이를 변수로 사용하기 위한 작업들을 진행합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 데이터 셋 1-lag만들기
+jd <- monthly_data_without_unknown
+jd <- jd[c(order(jd$base_year, jd$base_month)),]
+
+jdpast <- jd
+lag1emg <- c(jdpast$monthly_em_g) # 1월의 x, 2월의 y일때 1달 직전 값 넣기 위해 1월의 y를 생성
+
+jd1 <- jd %>% filter(base_month != 1 | base_year != 2018)
+lag1y <- c(jd1$monthly_em_g,rep(0,41)) # 1월의 x일때 2월의 y 생성
+
+jd$monthly_em_g <- lag1y
+jd$p_em_g <- lag1emg
+
+
+## 선형모형에서 각 변수들의 단위를 맞춰주기 위해, 학습데이터에 대해 표준화를 진행합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# stand 하기 위해 21-6 제거한 값들 기준(x)
+forminmaxall = jd %>% filter(base_month != 6 | base_year !=2021)
+
+afminmaxall = apply(forminmaxall[,c(4:21,24:31,37)], 2, function(x) {(x-mean(x,na.rm=T))/(sd(x,na.rm = T))})
+afminmaxall = cbind(forminmaxall[,c(2,3,32,33,22,23,35,36)], afminmaxall)
+
+train = afminmaxall
+
+
+## 7월을 예측하기위한 test데이터에도 표준화를 진행합니다. 
+## 이때 표준화에 사용되는 평균과 분산은 방금 전 학습데이터에서 구한 값을 사용합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# test 데이터 train 데이터 기반으로 표준화
+test <- jd %>% filter(base_month == 6, base_year == 2021) %>% select(-yyyymm)
+test <- test[,c(1,2,31,32,21,22,34,35,3:20,23:30,36)]
+
+meanx = apply(forminmaxall[,c(4:21,24:31,37)],2,function(x){mean(x)})
+sdx = apply(forminmaxall[,c(4:21,24:31,37)],2,function(x){sd(x)})
+
+for (i in 1:27) {
+  test[8+i] = (test[8+i]-meanx[i])/(sdx[i])
+}
+
+test <- test %>% select(-monthly_em_g)
+
+
+## 이제 6월까지 데이터를 학습하고, 7월을 예측합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 모델학습
+coordinates(train) <- c("center_long", "center_lat")
+coordinates(test) <- c("center_long", "center_lat")
+
+gwr.b7 <- gwr.sel(monthly_em_g ~ total_resd + msin + mcos + rain + p_em_g + 
+                    jeju_covid + old_resd_prop + foreign_resd + YZ_visit_prop, train)
+train_gwr7 <- gwr(monthly_em_g ~ total_resd + msin + mcos + rain + p_em_g + 
+                jeju_covid + old_resd_prop + foreign_resd + YZ_visit_prop, train, bandwidth = gwr.b7, hatmatrix=TRUE)
+
+test_gwr7 <- gwr(monthly_em_g ~ total_resd + msin + mcos + rain + p_em_g + 
+                   jeju_covid + old_resd_prop + foreign_resd + YZ_visit_prop, train, bandwidth = gwr.b7, fit.points = test,
+              predict = TRUE, se.fit = TRUE, fittedGWRobject = train_gwr7)
+
+# 예측 값 벡터화
+pred_gwr7 <- c(test_gwr7$SDF$pred)
+
+
+## 이제 두 달 뒤인 8월을 예측합니다. 
+## 아까는 예측을 위해 한 달 전의 배출량을 사용했지만, 현재 두 달 뒤를 예측하는 문제이기 때문에 두 달 전의 배출량을 x로 사용합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 데이터 셋 2-lag만들기
+jd <- monthly_data_without_unknown
+jd <- jd[c(order(jd$base_year, jd$base_month)),]
+
+jdpast2 <- jd
+lag2emg <- c(jdpast2$monthly_em_g) 
+
+jd2 <- jd %>% filter(base_month != 1 | base_year != 2018) %>% filter(base_month != 2 | base_year != 2018)
+lag2y <- c(jd2$monthly_em_g,rep(0,82)) 
+
+jd$monthly_em_g <- lag2y
+jd$p_em_g <- lag2emg
+
+# stand 하기 위해 21-5,6 제거한 값들 기준(x)
+forminmaxall = jd %>% filter(base_month != 5 | base_year != 2021) %>% filter(base_month != 6 | base_year != 2021)
+
+afminmaxall = apply(forminmaxall[,c(4:21,24:31,37)],2,function(x){(x-mean(x,na.rm=T))/(sd(x,na.rm = T))})
+afminmaxall = cbind(forminmaxall[,c(2,3,32,33,22,23,35,36)],afminmaxall)
+
+train = afminmaxall
+
+# stand 안한 test값들 처리
+test <- jd %>% filter(base_month == 6, base_year == 2021) %>% select(-yyyymm)
+test <- test[,c(1,2,31,32,21,22,34,35,3:20,23:30,36)]
+
+meanx = apply(forminmaxall[,c(4:21,24:31,37)],2,function(x){mean(x)})
+sdx = apply(forminmaxall[,c(4:21,24:31,37)],2,function(x){sd(x)})
+
+for (i in 1:27) {
+  test[8+i] = (test[8+i]-meanx[i])/(sdx[i])
+}
+
+test <- test %>% select(-monthly_em_g)
+
+# 모델학습
+coordinates(train) <- c("center_long", "center_lat")
+coordinates(test) <- c("center_long", "center_lat")
+
+gwr.b8 <- gwr.sel(monthly_em_g ~ total_resd+total_work+total_visit+msin+mcos+foreign_resd, train)
+train_gwr8 <- gwr(monthly_em_g ~ total_resd+total_work+total_visit+msin+mcos+foreign_resd, train, bandwidth = gwr.b8, hatmatrix=TRUE)
+test_gwr8 <- gwr(monthly_em_g ~ total_resd+total_work+total_visit+msin+mcos+foreign_resd, train, bandwidth = gwr.b8, fit.points = test,
+                 predict=TRUE, se.fit=TRUE, fittedGWRobject=train_gwr8)
+
+# 예측 값 벡터화
+pred_gwr8 <- c(test_gwr8$SDF$pred)
+
+
+## 두 결과를 하나의 데이터프레임으로 합칩니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+gwr_pred_result = data.frame(monthly_data$emd_nm[1:41], pred_gwr7, pred_gwr8)
+colnames(gwr_pred_result) = c('emd_nm', 'july', 'august')
+
+gwr_pred_result %>% head(2)
+
+
+rm(test)
+rm(train)
+rm(train_gwr7)
+rm(train_gwr8)
+rm(test_gwr7)
+rm(test_gwr8)
+
+## 결과가 위와 같습니다.
+
+
+# 2. 일별 모델
+
+#### 일별 데이터 불러오기
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+daily_raw_data = fread('data/daily_imputed_joined_data.csv')
+daily_raw_data_without_unknown = daily_raw_data %>% filter(emd_nm != '알수없음')  # 알수없음 제외
+dong_name = daily_raw_data$emd_nm[1:41]   # 행정동 이름 벡터화
+n_row = daily_raw_data_without_unknown %>% dim %>% .[1]   # 총 관측치 개수 저장
+
+
+#### 학습 데이터 기본 전처리
+
+## 일별 예측의 경우 1달/2달 뒤를 예측하기 위한 모델의 변수가 크게 바뀝니다. 
+## 7일의 계절성을 고려했을 때, 1달 뒤를 예측하는 모델에서는 이전 35일 전의 예측값을, 
+## 2달 뒤를 예측하는 모델에서는 이전 63일 전의 예측값을 사용해야하기 때문입니다. 
+## 따라서 이를 위한 데이터를 먼저 만들어 주고, 이후에 학습을 진행합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+## 1달 뒤 예측위한 학습 데이터
+daily_raw_data_without_unknown_lag35 = 
+  daily_raw_data_without_unknown %>% 
+  mutate(day = rep(1:1277, each = 41),
+         day_sin_7 = sin(2*pi/7 * day), day_cos_7 = cos(2*pi/7 * day),
+         day_sin_182 = sin(2*pi/182.5 * day), day_cos_182 = cos(2*pi/182.5 * day),
+         day_sin_365 = sin(2*pi/365 * day), day_cos_365 = cos(2*pi/365 * day),
+         weekday = daily_raw_data_without_unknown$yyyymm %>% weekdays,
+         weekend_after = ifelse((daily_raw_data_without_unknown$yyyymm %>% weekdays) %in% c('일요일', '월요일'), 1, 0),
+         peak_season = ifelse(daily_raw_data_without_unknown$base_month %in% c(6, 7, 8), 1, 0)) %>% 
+  .[41*35+1:n_row, ] %>% 
+  drop_na() %>% 
+  mutate(emg_shift35 = daily_raw_data_without_unknown$daily_em_g[1:(n_row-41*35)],
+         resd_shift35 = daily_raw_data_without_unknown$total_resd[1:(n_row-41*35)], 
+         work_shift35 = daily_raw_data_without_unknown$total_work[1:(n_row-41*35)],
+         visit_shift35 = daily_raw_data_without_unknown$total_visit[1:(n_row-41*35)],
+         forvisit_shift35 = daily_raw_data_without_unknown$foreign_visit[1:(n_row-41*35)],
+         delivery_amt_shift35 = daily_raw_data_without_unknown$total_delivery_amt[1:(n_row-41*35)],
+         market_amt_shift35 = daily_raw_data_without_unknown$total_market_amt[1:(n_row-41*35)],
+         eatout_amt_shift35 = daily_raw_data_without_unknown$total_eatout_amt[1:(n_row-41*35)],
+         allcovid_shift35 = daily_raw_data_without_unknown$allcovid[1:(n_row-41*35)],
+         jejucovid_shift35 = daily_raw_data_without_unknown$jejucovid[1:(n_row-41*35)],
+         baby_resd_prop_shift35 = daily_raw_data_without_unknown$baby_resd_prop[1:(n_row-41*35)],
+         YZ_resd_prop_shift35 = daily_raw_data_without_unknown$YZ_resd_prop[1:(n_row-41*35)],
+         X_resd_prop_shift35 = daily_raw_data_without_unknown$X_resd_prop[1:(n_row-41*35)],
+         old_resd_prop_shift35 = daily_raw_data_without_unknown$old_resd_prop[1:(n_row-41*35)]) %>% 
+  select(-base_month, -base_year, -total_resd, -total_work, -total_visit, 
+         -foreign_resd, -foreign_visit, foreign_work, -total_use_cnt, -total_use_amt, -total_market_amt, -total_market_cnt,
+         -weekday, -total_delivery_cnt, -total_delivery_amt, -total_eatout_amt, -total_eatout_cnt,
+         -baby_visit_prop, -YZ_visit_prop, -X_visit_prop, -old_visit_prop, -foreign_work, -all_covid, -jeju_covid, -after_covid,
+         -baby_resd_prop, -YZ_resd_prop, -X_resd_prop, -old_resd_prop, -rain) %>%  
+  .[41*330+1:n_row, ] %>% 
+  drop_na() %>% 
+  mutate(emg_shift365 = daily_raw_data_without_unknown$daily_em_g[1:(n_row-41*365)],
+         visit_shift365 = daily_raw_data_without_unknown$total_visit[1:(n_row-41*365)]) 
+
+
+## 1달 뒤 예측을 위한 데이터입니다. 365일 이전 값과 35일 이전 값들을 학습에 사용할 예정입니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+## 2달 뒤 예측위한 학습 데이터
+daily_raw_data_without_unknown_lag63 = 
+  daily_raw_data_without_unknown %>% 
+  mutate(day = rep(1:1277, each = 41),
+         day_sin_7 = sin(2*pi/7 * day), day_cos_7 = cos(2*pi/7 * day),
+         day_sin_182 = sin(2*pi/182.5 * day), day_cos_182 = cos(2*pi/182.5 * day),
+         day_sin_365 = sin(2*pi/365 * day), day_cos_365 = cos(2*pi/365 * day),
+         weekday = daily_raw_data_without_unknown$yyyymm %>% weekdays,
+         weekend_after = ifelse((daily_raw_data_without_unknown$yyyymm %>% weekdays) %in% c('일요일', '월요일'), 1, 0),
+         peak_season = ifelse(daily_raw_data_without_unknown$base_month %in% c(6, 7, 8), 1, 0)) %>% 
+  .[41*63+1:n_row, ] %>% 
+  drop_na() %>% 
+  mutate(emg_shift63 = daily_raw_data_without_unknown$daily_em_g[1:(n_row-41*63)],
+         resd_shift63 = daily_raw_data_without_unknown$total_resd[1:(n_row-41*63)], 
+         work_shift63 = daily_raw_data_without_unknown$total_work[1:(n_row-41*63)],
+         visit_shift63 = daily_raw_data_without_unknown$total_visit[1:(n_row-41*63)],
+         forvisit_shift63 = daily_raw_data_without_unknown$foreign_visit[1:(n_row-41*63)],
+         delivery_amt_shift63 = daily_raw_data_without_unknown$total_delivery_amt[1:(n_row-41*63)],
+         market_amt_shift63 = daily_raw_data_without_unknown$total_market_amt[1:(n_row-41*63)],
+         eatout_amt_shift63 = daily_raw_data_without_unknown$total_eatout_amt[1:(n_row-41*63)],
+         allcovid_shift63 = daily_raw_data_without_unknown$allcovid[1:(n_row-41*63)],
+         jejucovid_shift63 = daily_raw_data_without_unknown$jejucovid[1:(n_row-41*363)],
+         baby_resd_prop_shift63 = daily_raw_data_without_unknown$baby_resd_prop[1:(n_row-41*63)],
+         YZ_resd_prop_shift63 = daily_raw_data_without_unknown$YZ_resd_prop[1:(n_row-41*63)],
+         X_resd_prop_shift63 = daily_raw_data_without_unknown$X_resd_prop[1:(n_row-41*63)],
+         old_resd_prop_shift63 = daily_raw_data_without_unknown$old_resd_prop[1:(n_row-41*63)]) %>% 
+  select(-base_month, -base_year, -total_resd, -total_work, -total_visit, 
+         -foreign_resd, -foreign_visit, foreign_work, -total_use_cnt, -total_use_amt, -total_market_amt, -total_market_cnt,
+         -weekday, -total_delivery_cnt, -total_delivery_amt, -total_eatout_amt, -total_eatout_cnt,
+         -baby_visit_prop, -YZ_visit_prop, -X_visit_prop, -old_visit_prop, -foreign_work, -all_covid, -jeju_covid, -after_covid,
+         -baby_resd_prop, -YZ_resd_prop, -X_resd_prop, -old_resd_prop, -rain) %>%  
+  .[41*302+1:n_row, ] %>% 
+  drop_na() %>% 
+  mutate(emg_shift365 = daily_raw_data_without_unknown$daily_em_g[1:(n_row-41*365)],
+         visit_shift365 = daily_raw_data_without_unknown$total_visit[1:(n_row-41*365)]) 
+
+
+## 2달 뒤 예측을 위한 데이터입니다. 365일 이전 값과 63일 이전 값들을 학습에 사용할 예정입니다.
+
+## 2.1 LightGBM 학습과 예측
+
+## LightGBM을 학습하기에 앞서, 변수들을 스케일링scaling(standardization) 해줍니다. 
+## 트리모델의 경우, 통계모델이나 딥러닝 모형에 비해 변수 특성을 정규화나 표준화의 필요성이 절대적이지는 않습니다. 
+## 하지만 이 과정에서 변수들의 단위를 통일시키고, 학습에 변수로 사용되는 이전 배출량의 중요도를 높이기 위함입니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+train_lgbm1_x = daily_raw_data_without_unknown_lag35 %>% filter(yyyymm < as.Date('2021-07-01')) 
+train_lgbm1_x_mean = apply(train_lgbm1_x %>% select(-yyyymm, -emd_nm, -daily_em_g, -emg_shift35, -emg_shift365), 2, mean, na.rm = T)
+train_lgbm1_x_sd = apply(train_lgbm1_x %>% select(-yyyymm, -emd_nm, -daily_em_g, -emg_shift35, -emg_shift365), 2, sd)
+train_lgbm1_x_scaled = train_lgbm1_x %>% select(yyyymm, emd_nm, daily_em_g, emg_shift35, emg_shift365) %>% 
+  cbind(sweep(train_lgbm1_x %>% 
+                select(-yyyymm, -emd_nm, -daily_em_g, -emg_shift35, -emg_shift365), 2L, train_lgbm1_x_mean) %>% sweep(2, train_lgbm1_x_sd, '/'))
+
+train_lgbm2_x = daily_raw_data_without_unknown_lag63 %>% filter(yyyymm < as.Date('2021-07-01')) 
+train_lgbm2_x_mean = apply(train_lgbm2_x %>% select(-yyyymm, -emd_nm, -daily_em_g, -emg_shift63, -emg_shift365), 2, mean, na.rm = T)
+train_lgbm2_x_sd = apply(train_lgbm2_x %>% select(-yyyymm, -emd_nm, -daily_em_g, -emg_shift63, -emg_shift365), 2, sd)
+train_lgbm2_x_scaled = train_lgbm2_x %>% select(yyyymm, emd_nm, daily_em_g, emg_shift63, emg_shift365) %>% 
+  cbind(sweep(train_lgbm2_x %>% 
+                select(-yyyymm, -emd_nm, -daily_em_g, -emg_shift63, -emg_shift365), 2L, train_lgbm2_x_mean) %>% sweep(2, train_lgbm2_x_sd, '/'))
+
+
+## 표준화에 사용된 평균과 분산은 저장한 후, 이후 test 데이터를 표준화 하는데에도 사용하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+lgbm1_data_parameter = list()
+lgbm1_data_parameter$train_x_mean = train_lgbm1_x_mean
+lgbm1_data_parameter$train_x_sd = train_lgbm1_x_sd
+
+lgbm2_data_parameter = list()
+lgbm2_data_parameter$train_x_mean = train_lgbm2_x_mean
+lgbm2_data_parameter$train_x_sd = train_lgbm2_x_sd
+
+lgbm_data_parameter = list()
+lgbm_data_parameter$lgbm1_data_parameter = lgbm1_data_parameter
+lgbm_data_parameter$lgbm2_data_parameter = lgbm2_data_parameter
+
+
+## 이후 LightGBM 모델을 학습합니다.
+
+detach("package:forecast", unload=TRUE)
+detach("package:spgwr", unload=TRUE)
+detach("package:BayesTree", unload=TRUE)
+
+## ---- message = F----------------------------------------------------------------------------------------------------------------------
+set.seed(42)
+params = list('boosting_type' = 'gbdt', 'objective' = 'regression', 'metric' = 'rmse', 
+              'learning_rate' = 0.005, 'num_iteration' = 1000, verbose = -1, max_depth = -1L, num_leaves = 38, feature_fraction = 0.9,
+              seed = 42, 'lambda_l2' = 2, 'num_threads' = 4, 'bagging_fraction' = 0.9)
+
+lgb_dataset1 = lgb.Dataset(data = train_lgbm1_x_scaled %>% select(-daily_em_g, -yyyymm, -emd_nm) %>% as.matrix, 
+                           label = train_lgbm1_x_scaled$daily_em_g)
+lgb_dataset2 = lgb.Dataset(data = train_lgbm2_x_scaled %>% select(-daily_em_g, -yyyymm, -emd_nm) %>% as.matrix, 
+                           label = train_lgbm2_x_scaled$daily_em_g)
+
+###########################################################################
+# 만약 R Session Aborted가 발생할 경우 실행
+## train_lgbm1 = readRDS.lgb.Booster('lightgbm_model/lgbm_model_one.rds')
+## train_lgbm2 = readRDS.lgb.Booster('lightgbm_model/lgbm_model_two.rds')
+###########################################################################
+
+
+# 만약 R Session Aborted가 발생할 경우 주석처리
+# 1달 뒤를 위한 모형
+train_lgbm1 = lgb.train(data = lgb_dataset1, params = params)
+# 2달 뒤를 위한 모형
+train_lgbm2 = lgb.train(data = lgb_dataset2, params = params)
+
+
+
+
+## 학습한 모형을 바탕으로 예측을 시행합니다. 
+## 이를 위해서는 test데이터를 우리가 가진 데이터 form에 맞게 기본적인 작업이 필요합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+test_date_time1 = seq(as.Date('2021-07-01'), as.Date('2021-07-31'), by = 1)
+test_date_time1_df = rep(test_date_time1, each = 41) %>% as.data.frame() %>% rename(yyyymm = '.')
+test_date_time1_df %>% head(2)
+
+test_date_time2 = seq(as.Date('2021-08-01'), as.Date('2021-08-31'), by = 1)
+test_date_time2_df = rep(test_date_time2, each = 41) %>% as.data.frame() %>% rename(yyyymm = '.')
+test_date_time2_df %>% head(2)
+
+
+## 일별 예측값의 저장을 위한 데이터프레임을 생성합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 7월 예측용 데이터
+test_x_one = 
+  test_date_time1_df %>% 
+  mutate(center_long = daily_raw_data_without_unknown$center_long[(n_row - 35*41 + 1):(n_row - 4*41)],
+         center_lat = daily_raw_data_without_unknown$center_lat[(n_row - 35*41 + 1):(n_row - 4*41)],
+         single_house = daily_raw_data_without_unknown$single_house[(n_row - 35*41 + 1):(n_row - 4*41)],
+         apartment = daily_raw_data_without_unknown$apartment[(n_row - 35*41 + 1):(n_row - 4*41)],
+         townhouse = daily_raw_data_without_unknown$townhouse[(n_row - 35*41 + 1):(n_row - 4*41)],
+         multifamily = daily_raw_data_without_unknown$multifamily[(n_row - 35*41 + 1):(n_row - 4*41)],
+         shopping_pca = daily_raw_data_without_unknown$shopping_pca[(n_row - 35*41 + 1):(n_row - 4*41)],
+         day = rep(1277:1307, each = 41),
+         day_sin_7 = sin(2*pi/7 * day), day_cos_7 = cos(2*pi/7 * day),
+         day_sin_182 = sin(2*pi/182.5 * day), day_cos_182 = cos(2*pi/182.5 * day),
+         day_sin_365 = sin(2*pi/365 * day), day_cos_365 = cos(2*pi/365 * day),
+         weekend_after = ifelse((yyyymm %>% weekdays) %in% c('일요일', '월요일'), 1, 0),
+         peak_season = ifelse(month(yyyymm) %in% c(6, 7, 8), 1, 0),
+         emg_shift35 = daily_raw_data_without_unknown$daily_em_g[(n_row - 35*41 + 1):(n_row - 4*41)],
+         resd_shift35 = daily_raw_data_without_unknown$total_resd[(n_row - 35*41 + 1):(n_row - 4*41)],
+         work_shift35 = daily_raw_data_without_unknown$total_work[(n_row - 35*41 + 1):(n_row - 4*41)],
+         visit_shift35 = daily_raw_data_without_unknown$total_visit[(n_row - 35*41 + 1):(n_row - 4*41)],
+         forvisit_shift35 = daily_raw_data_without_unknown$foreign_visit[(n_row - 35*41 + 1):(n_row - 4*41)],
+         delivery_amt_shift35 = daily_raw_data_without_unknown$total_delivery_amt[(n_row - 35*41 + 1):(n_row - 4*41)],
+         market_amt_shift35 = daily_raw_data_without_unknown$total_market_amt[(n_row - 35*41 + 1):(n_row - 4*41)],
+         eatout_amt_shift35 = daily_raw_data_without_unknown$total_eatout_amt[(n_row - 35*41 + 1):(n_row - 4*41)],
+         allcovid_shift35 = daily_raw_data_without_unknown$allcovid[(n_row - 35*41 + 1):(n_row - 4*41)],
+         jejucovid_shift35 = daily_raw_data_without_unknown$jejucovid[(n_row - 35*41 + 1):(n_row - 4*41)],
+         baby_resd_prop_shift35 = daily_raw_data_without_unknown$baby_resd_prop[(n_row - 35*41 + 1):(n_row - 4*41)],
+         YZ_resd_prop_shift35 = daily_raw_data_without_unknown$YZ_resd_prop[(n_row - 35*41 + 1):(n_row - 4*41)],
+         X_resd_prop_shift35 = daily_raw_data_without_unknown$X_resd_prop[(n_row - 35*41 + 1):(n_row - 4*41)],
+         old_resd_prop_shift35 = daily_raw_data_without_unknown$old_resd_prop[(n_row - 35*41 + 1):(n_row - 4*41)],
+         emg_shift365 = daily_raw_data_without_unknown$daily_em_g[(n_row - 365*41 +1):(n_row - 334*41)],
+         visit_shift365 = daily_raw_data_without_unknown$total_visit[(n_row - 365*41 +1):(n_row - 334*41)])
+
+
+## 7월 예측에 사용할 데이터입니다. 365일 이전 값과 35일 이전 값이 잘 들어갔는지 확인하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 7월을 예측하기 위한 365일 이전 값
+daily_raw_data_without_unknown[(n_row - 365*41 +1):(n_row - 334*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% head(3)
+daily_raw_data_without_unknown[(n_row - 365*41 +1):(n_row - 334*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% tail(3)
+
+# 7월을 예측하기 위한 35일 이전 값
+daily_raw_data_without_unknown[(n_row - 35*41 + 1):(n_row - 4*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% head(3)
+daily_raw_data_without_unknown[(n_row - 35*41 + 1):(n_row - 4*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% tail(3)
+
+
+## 매칭이 잘 된 것을 확인할 수 있습니다. 실제로 7월 1일은 목요일이고, 35일 전인 5월 27일도 목요일입니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 8월 예측용 데이터
+test_x_two = 
+  test_date_time2_df %>% 
+  mutate(center_long = daily_raw_data_without_unknown$center_long[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         center_lat = daily_raw_data_without_unknown$center_lat[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         single_house = daily_raw_data_without_unknown$single_house[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         apartment = daily_raw_data_without_unknown$apartment[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         townhouse = daily_raw_data_without_unknown$townhouse[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         multifamily = daily_raw_data_without_unknown$multifamily[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         shopping_pca = daily_raw_data_without_unknown$shopping_pca[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         day = rep(1308:1338, each = 41),
+         day_sin_7 = sin(2*pi/7 * day), day_cos_7 = cos(2*pi/7 * day),
+         day_sin_182 = sin(2*pi/182.5 * day), day_cos_182 = cos(2*pi/182.5 * day),
+         day_sin_365 = sin(2*pi/365 * day), day_cos_365 = cos(2*pi/365 * day),
+         weekend_after = ifelse((yyyymm %>% weekdays) %in% c('일요일', '월요일'), 1, 0),
+         peak_season = ifelse(month(yyyymm) %in% c(6, 7, 8), 1, 0),
+         emg_shift63 = daily_raw_data_without_unknown$daily_em_g[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         resd_shift63 = daily_raw_data_without_unknown$total_resd[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         work_shift63 = daily_raw_data_without_unknown$total_work[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         visit_shift63 = daily_raw_data_without_unknown$total_visit[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         forvisit_shift63 = daily_raw_data_without_unknown$foreign_visit[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         delivery_amt_shift63 = daily_raw_data_without_unknown$total_delivery_amt[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         market_amt_shift63 = daily_raw_data_without_unknown$total_market_amt[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         eatout_amt_shift63 = daily_raw_data_without_unknown$total_eatout_amt[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         allcovid_shift63 = daily_raw_data_without_unknown$allcovid[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         jejucovid_shift63 = daily_raw_data_without_unknown$jejucovid[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         baby_resd_prop_shift63 = daily_raw_data_without_unknown$baby_resd_prop[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         YZ_resd_prop_shift63 = daily_raw_data_without_unknown$YZ_resd_prop[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         X_resd_prop_shift63 = daily_raw_data_without_unknown$X_resd_prop[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         old_resd_prop_shift63 = daily_raw_data_without_unknown$old_resd_prop[(n_row - 32*41 + 1):(n_row - 1*41)], 
+         emg_shift365 = daily_raw_data_without_unknown$daily_em_g[(n_row - 334*41 +1):(n_row - 303*41)],
+         visit_shift365 = daily_raw_data_without_unknown$total_visit[(n_row - 334*41 +1):(n_row - 303*41)])
+
+
+## 8월 예측에 사용할 데이터입니다. 365일 이전 값과 63일 이전 값이 잘 들어갔는지 확인하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 7월을 예측하기 위한 365일 이전 값
+daily_raw_data_without_unknown[(n_row - 334*41 +1):(n_row - 303*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% head(3)
+daily_raw_data_without_unknown[(n_row - 334*41 +1):(n_row - 303*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% tail(3)
+
+# 7월을 예측하기 위한 63일 이전 값
+daily_raw_data_without_unknown[(n_row - 32*41 + 1):(n_row - 1*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% head(3)
+daily_raw_data_without_unknown[(n_row - 32*41 + 1):(n_row - 1*41), ] %>% select(yyyymm, emd_nm, daily_em_g) %>% tail(3)
+
+
+## 매칭이 잘 된 것을 확인할 수 있습니다. 실제로 8월 1일은 일요일이고, 63일 전인 5월 30일도 일요일입니다.
+
+## 해당 데이터를 train 과정에서 구한 평균과 분산으로 표준화하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+test_lgbm1_x = test_x_one %>% select(-yyyymm)
+test_lgbm1_x_scaled = 
+  test_lgbm1_x %>% select(emg_shift35, emg_shift365) %>% 
+  cbind(sweep(sweep(test_lgbm1_x %>% 
+                      select(-emg_shift35, -emg_shift365), 2L, lgbm_data_parameter$lgbm1_data_parameter$train_x_mean), 
+              2, lgbm_data_parameter$lgbm1_data_parameter$train_x_sd, "/"))
+
+test_lgbm2_x = test_x_two %>% select(-yyyymm)
+test_lgbm2_x_scaled = 
+  test_lgbm2_x %>% select(emg_shift63, emg_shift365) %>% 
+  cbind(sweep(
+    sweep(test_lgbm2_x %>% select(-emg_shift63, -emg_shift365), 2L, lgbm_data_parameter$lgbm2_data_parameter$train_x_mean), 
+              2, lgbm_data_parameter$lgbm2_data_parameter$train_x_sd, "/"))
+
+
+## 7월과 8월예 대해 예측을 시행하고, 월별로 합치도록 하겠습니다.
+
+## ---- message = F----------------------------------------------------------------------------------------------------------------------
+# 예측 시행
+pred_lgbm1_daily = predict(train_lgbm1, test_lgbm1_x_scaled %>% as.matrix)
+pred_lgbm2_daily = predict(train_lgbm2, test_lgbm2_x_scaled %>% as.matrix)
+
+# 두 결과 결합
+pred_lgbm_daily = data.frame(c(rep(test_date_time1, each = 41), rep(test_date_time2, each = 41)), 
+                             rep(dong_name, 62), c(pred_lgbm1_daily, pred_lgbm2_daily)) 
+colnames(pred_lgbm_daily) = c('yyyymm', 'emd_nm', 'pred')
+
+# 월별로 변환
+lgbm_pred_result = 
+  pred_lgbm_daily %>% mutate(base_month = month(yyyymm)) %>% 
+  group_by(base_month, emd_nm) %>% 
+  summarise(pred = sum(pred)) %>% ungroup() %>% 
+  spread(key = base_month, pred) %>% 
+  rename(july = `7`, august = `8`)
+
+
+## 결과를 확인하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+lgbm_pred_result %>% head(2)
+
+
+
+## 2.2 BART 학습과 예측
+
+## BART의 경우 학습데이터의 X,y 와 평가용데이터의 X를 대입하면 한번에 결과를 반환해줍니다. 이를 바로 시행하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+# 학습후 x 값을 대입해 바로 예측
+
+library(BayesTree)
+train_bart1_x = daily_raw_data_without_unknown_lag35 %>% select(-yyyymm, -emd_nm, -daily_em_g)
+train_bart1_y = daily_raw_data_without_unknown_lag35$daily_em_g
+test_bart1_x = test_x_one %>% select(-yyyymm)
+set.seed(99)
+train_bart1 = bart(train_bart1_x, train_bart1_y, test_bart1_x, sigdf = 10, sigquant = 0.70, k = 2.0,
+                   power = 2, base = 0.95, ndpost = 500)
+
+train_bart2_x = daily_raw_data_without_unknown_lag63 %>% select(-yyyymm, -emd_nm, -daily_em_g)
+train_bart2_y = daily_raw_data_without_unknown_lag63$daily_em_g
+test_bart2_x = test_x_two %>% select(-yyyymm)
+set.seed(99)
+train_bart2 = bart(train_bart2_x, train_bart2_y, test_bart2_x, power = 2, base = 0.95, ndpost = 500)
+
+
+## 학습이 완료되었고, 일별 결과를 월별 결과로 변환하겠습니다.
+
+## ---- message = F----------------------------------------------------------------------------------------------------------------------
+# 일별 예측값 저장
+pred_bart1_daily = train_bart1$yhat.test.mean
+pred_bart2_daily = train_bart2$yhat.test.mean
+
+# 두 값 합치기
+pred_bart_daily = data.frame(c(rep(test_date_time1, each = 41), rep(test_date_time2, each = 41)), 
+                             rep(dong_name, 62), c(pred_bart1_daily, pred_bart2_daily)) 
+colnames(pred_bart_daily) = c('yyyymm', 'emd_nm', 'pred')
+
+# 월별 결과로 변환
+bart_pred_result = 
+  pred_bart_daily %>% mutate(base_month = month(yyyymm)) %>% 
+  group_by(base_month, emd_nm) %>% 
+  summarise(pred = sum(pred)) %>% ungroup() %>% 
+  spread(key = base_month, pred) %>% 
+  rename(july = `7`, august = `8`)
+
+
+## BART의 예측 결과를 확인하겠습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+bart_pred_result %>% head(2)
+
+
+# 3. 앙상블
+
+## 시계열 데이터에 대한 예측에서는 모든 시점이 동질적이기 어렵기 때문에,
+## 특정 시점을 잘 맞추는 모델이 전역적으로 성능이 좋기는 매우 어렵습니다. 
+## 따라서 단일 모델로 7/8월을 예측하기보다, 
+## 4개의 모델들 예측값의 가중평균을 실제 예측값으로 사용함으로서 더 일반화된 성능을 얻어낼 수 있습니다. 
+## 이 경우에 단순히 성능에 집중하기보다도, 7/8월 뿐만 아니라 보다 일반적인 모델을 만들기 위한 과정입니다. 
+## 각 모델들의 장점은 합쳐지고 단점들은 상쇄되면서 더 좋은 모델이 만들어질 것입니다.
+
+## 이들의 가중평균 비율은 이전에 3/4/5/6월에 대한 성능을 비교하면서 만들어 졌습니다.
+
+## 모든 예측값을 모읍니다.
+
+## ---- message = F----------------------------------------------------------------------------------------------------------------------
+combine_pred_result = 
+  arima_pred_result %>% 
+  left_join(gwr_pred_result, by = 'emd_nm') %>% 
+  left_join(lgbm_pred_result, by = 'emd_nm') %>% 
+  left_join(bart_pred_result, by = 'emd_nm')  
+
+colnames(combine_pred_result) = c('emd_nm', 'arima_july', 'arima_august', 'gwr_july', 'gwr_august', 
+                                  'lgbm_july', 'lgbm_august', 'bart_july', 'bart_august')
+combine_pred_result %>% mutate(july = 0.1*arima_july + 0.2*gwr_july + 0.3*lgbm_july + 0.4*bart_july,
+                               august = 0.1*arima_august + 0.4*gwr_august + 0.4*lgbm_august + 0.1*bart_august)
+
+
+## 이 예측값들의 가중평균을 구합니다. `알수없음`도 다시 확인해줍니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+final_prediction = 
+  combine_pred_result %>% 
+  mutate(july = 0.1*arima_july + 0.2*gwr_july + 0.3*lgbm_july + 0.4*bart_july,
+         august = 0.1*arima_august + 0.4*gwr_august + 0.4*lgbm_august + 0.1*bart_august) %>% 
+  select(emd_nm, july, august)
+final_prediction[final_prediction$emd_nm == '알수없음', 2:3] = arima_pred_result[arima_pred_result$emd_nm == '알수없음', 2:3]
+
+
+## 최종 예측값은 다음과 같습니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+final_prediction
+
+
+## 이를 저장합니다.
+
+## --------------------------------------------------------------------------------------------------------------------------------------
+final_prediction %>% fwrite('데이터분석분야_퓨처스리그_ECO제주_UmStatistics_평가데이터.csv')
+
+
+
